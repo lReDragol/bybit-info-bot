@@ -1,13 +1,13 @@
 {
     "USE_API": false,
-    "TOKEN": "1161970074:AAHKbvU5blGSAn32nLKuGFXmI53VT1cBXbk",
-    "API_KEY": "bUe2QdM0yLM0RraYtr",
-    "API_SECRET": "oXKk21LfZXAB1zuC5AicJMFGE9cyCL7MjoB3",
-    "cookies": "segfsegwsegwawdawdi.awdawfgrfgdsgrf.fefqwfjr",
+    "TOKEN": "",
+    "API_KEY": "",
+    "API_SECRET": "",
+    "cookies": "",
     "admins": [
-        1234567890
+        123456789
     ],
-    "db_update_interval": 30,
-    "balance_send_interval": 30,
-    "chat_id": -1001035123405
+    "db_update_interval": 1,
+    "balance_send_interval": 1,
+    "chat_id": -123
 }

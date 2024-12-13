@@ -13,11 +13,14 @@ import time
 import sys
 import json
 import os
+import matplotlib.dates as mdates
+from matplotlib.ticker import MaxNLocator
 
 logging.basicConfig(level=logging.ERROR)
 plt.switch_backend('Agg')
 
 CONFIG_FILE = 'config.json'
+
 
 def load_config():
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -35,8 +38,8 @@ API_KEY = config.get('API_KEY', '')
 API_SECRET = config.get('API_SECRET', '')
 cookies = config.get('cookies', '')
 admins = config.get('admins', [])
-db_update_interval = config.get('db_update_interval', 30)       # интервал обновления БД (мин)
-balance_send_interval = config.get('balance_send_interval', 30) # интервал отправки баланса (мин)
+db_update_interval = config.get('db_update_interval', 30)
+balance_send_interval = config.get('balance_send_interval', 30)
 chat_id = config.get('chat_id', '')
 
 REQUEST_TIMEOUT = 60
@@ -47,20 +50,24 @@ WAITING_FOR_RENEW = False
 BYBIT_DOMAINS = [
     "https://api.bybit.com"
 ]
-BASE_URL = None
 
 bot = telebot.TeleBot(TOKEN)
+
+BALANCE_URL = 'https://api2.bybit.com/v3/private/cht/asset-common/total-balance?quoteCoin=USDT&balanceType=1'
+BOT_LIST_URL = 'https://api2.bybit.com/s1/bot/tradingbot/v1/list-all-bots'
+
+BASE_URL = None
+
+
 
 keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
 keyboard.add(types.KeyboardButton('/balance'), types.KeyboardButton('/graph'))
 
 last_balance = None
 
-# Потоки для обновления и отправки баланса
 db_update_thread = None
 balance_send_thread = None
-stop_threads = False  # Флаг для остановки потоков при перезапуске
-
+stop_threads = False
 
 def setup_excel():
     try:
@@ -141,13 +148,26 @@ def generate_signature(secret, timestamp, api_key, recv_window, params_str):
     pre_sign_str = str(timestamp) + api_key + str(recv_window) + params_str
     return hmac.new(secret.encode('utf-8'), pre_sign_str.encode('utf-8'), hashlib.sha256).hexdigest()
 
+
+def fetch_bot_list_data():
+    if WAITING_FOR_RENEW:
+        return []
+    response = retry_request(BOT_LIST_URL, method='POST', cookies_arg={'secure-token': cookies})
+    if response and not WAITING_FOR_RENEW:
+        data = response.json()
+        if data.get("ret_code") == 0:
+            bots = data.get("result", {}).get("bots", [])
+            return bots
+    return []
+
+
 def fetch_balance_cookies(add_to_db=True):
     global last_balance
     if WAITING_FOR_RENEW:
         return "Бот в режиме ожидания обновления данных."
 
     response = retry_request(
-        'https://api2.bybit.com/v3/private/cht/asset-common/total-balance?quoteCoin=USDT&balanceType=1',
+        BALANCE_URL,
         cookies_arg={'secure-token': cookies})
     if response and not WAITING_FOR_RENEW:
         data = response.json()
@@ -162,7 +182,7 @@ def fetch_balance_cookies(add_to_db=True):
                         rub_balance = "Ошибка курса"
 
                     now = datetime.now()
-                    # Изменение за 24ч
+
                     rows = list(worksheet.iter_rows(values_only=True))[1:]
                     closest_balance_24h_ago = None
                     closest_time_diff = float('inf')
@@ -195,6 +215,7 @@ def fetch_balance_cookies(add_to_db=True):
             expire_mode_notify()
             return "Срок действия cookies истёк. Бот в ожидании."
     return "Ошибка соединения или данные недоступны"
+
 
 def fetch_balance_api(add_to_db=True):
     global last_balance
@@ -279,11 +300,27 @@ def fetch_balance_api(add_to_db=True):
     expire_mode_notify()
     return "Ошибка соединения или данные недоступны. Бот в ожидании."
 
+
 def fetch_balance(add_to_db=True):
     if USE_API:
-        return fetch_balance_api(add_to_db=add_to_db)
+        balance_info = fetch_balance_api(add_to_db=add_to_db)
     else:
-        return fetch_balance_cookies(add_to_db=add_to_db)
+        balance_info = fetch_balance_cookies(add_to_db=add_to_db)
+    if isinstance(balance_info, str) and "Баланс:" in balance_info:
+        rows = list(worksheet.iter_rows(values_only=True))[1:]
+        now_ts = time.time()
+        count_24h = sum(
+            1 for r in rows if (now_ts - datetime.strptime(r[0], '%Y-%m-%d %H:%M:%S').timestamp()) <= 24 * 3600)
+        if len(rows) > 1:
+            last_balance_val = rows[-1][1]
+            prev_balance_val = rows[-2][1]
+            diff = last_balance_val - prev_balance_val
+            diff_str = f"Изменение с последнего замера: {'+' if diff >= 0 else ''}{diff:.2f} USDT"
+        else:
+            diff_str = "Недостаточно данных для расчёта изменения с последнего замера."
+
+        balance_info += f"\n📊 Записей за последние 24ч: {count_24h}\n{diff_str}"
+    return balance_info
 
 
 @bot.message_handler(commands=['start', 'help'])
@@ -308,83 +345,232 @@ def send_graph(message):
         if len(rows) < 2:
             bot.send_message(message.chat.id, "Недостаточно данных для построения графика")
             return
-
         daily_balances = {}
         current_day_balances = []
+        now_date = datetime.now().date()
 
         for row in rows:
-            timestamp = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
+            timestamp_str = row[0]
+            try:
+                timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                continue
             date = timestamp.date()
             balance_usdt = row[1]
             if isinstance(balance_usdt, (int, float)):
                 if date not in daily_balances:
-                    daily_balances[date] = {'sum_balance': 0, 'count': 0}
-                daily_balances[date]['sum_balance'] += balance_usdt
-                daily_balances[date]['count'] += 1
-
-                # Добавляем точки за текущий день если время ровно в 0 или 30 минут
-                if date == datetime.now().date() and (timestamp.minute in [0,30]):
+                    daily_balances[date] = []
+                daily_balances[date].append(balance_usdt)
+                if date == now_date:
                     current_day_balances.append((timestamp, balance_usdt))
-
-        average_daily_balances = [(date, values['sum_balance'] / values['count']) for date, values in daily_balances.items()]
-
+        average_daily_balances = []
+        max_daily_balances = []
+        min_daily_balances = []
+        for date, balances in daily_balances.items():
+            avg = sum(balances) / len(balances)
+            maximum = max(balances)
+            minimum = min(balances)
+            average_daily_balances.append((date, avg))
+            max_daily_balances.append((date, maximum))
+            min_daily_balances.append((date, minimum))
         average_daily_balances.sort(key=lambda x: x[0])
-
         if len(average_daily_balances) > 30:
-            average_daily_balances = average_daily_balances[-30:]
+            average_daily_balances_last_month = average_daily_balances[-30:]
+            max_daily_balances_last_month = max_daily_balances[-30:]
+            min_daily_balances_last_month = min_daily_balances[-30:]
+        else:
+            average_daily_balances_last_month = average_daily_balances
+            max_daily_balances_last_month = max_daily_balances
+            min_daily_balances_last_month = min_daily_balances
 
-        dates = [item[0] for item in average_daily_balances]
-        average_balances_usdt = [item[1] for item in average_daily_balances]
+        dates_last_month = [item[0] for item in average_daily_balances_last_month]
+        average_balances_usdt_last_month = [item[1] for item in average_daily_balances_last_month]
+        max_balances_last_month = [item[1] for item in max_daily_balances_last_month]
+        min_balances_last_month = [item[1] for item in min_daily_balances_last_month]
+        one_year_ago = now_date - timedelta(days=365)
+        monthly_balances = {}
+        for date, balances in daily_balances.items():
+            if date >= one_year_ago:
+                month = date.replace(day=1)
+                if month not in monthly_balances:
+                    monthly_balances[month] = []
+                monthly_balances[month].extend(balances)
 
+        average_monthly_balances_year = []
+        max_monthly_balances_year = []
+        min_monthly_balances_year = []
+        for month, balances in monthly_balances.items():
+            avg = sum(balances) / len(balances)
+            maximum = max(balances)
+            minimum = min(balances)
+            average_monthly_balances_year.append((month, avg))
+            max_monthly_balances_year.append((month, maximum))
+            min_monthly_balances_year.append((month, minimum))
+        average_monthly_balances_year.sort(key=lambda x: x[0])
+
+        dates_year = [item[0] for item in average_monthly_balances_year]
+        average_balances_usdt_year = [item[1] for item in average_monthly_balances_year]
+        max_balances_year = [item[1] for item in max_monthly_balances_year]
+        min_balances_year = [item[1] for item in min_monthly_balances_year]
         if len(current_day_balances) < 2:
-            bot.send_message(message.chat.id, "Недостаточно данных за текущий день для построения графика")
+            bot.send_message(message.chat.id, "Недостаточно данных за текущий день для построения детального графика")
             return
 
         current_day_balances.sort(key=lambda x: x[0])
         times = [item[0] for item in current_day_balances]
         balances_usdt = [item[1] for item in current_day_balances]
+        bots_data = fetch_bot_list_data()
+        fig = plt.figure(figsize=(20, 12), tight_layout=True)
+        gs = fig.add_gridspec(3, 2, width_ratios=[4, 1], height_ratios=[2, 2, 2], wspace=0.2, hspace=0.3)
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax2 = fig.add_subplot(gs[1, 0])
+        ax3 = fig.add_subplot(gs[2, 0])
+        ax4 = fig.add_subplot(gs[:, 1])
+        ax4.axis('off')
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), sharex=False)
+        y_locator = MaxNLocator(nbins=10)
+        ax1.yaxis.set_major_locator(y_locator)
+        ax2.yaxis.set_major_locator(y_locator)
+        ax3.yaxis.set_major_locator(y_locator)
 
-        ax1.plot(times, balances_usdt, marker='o', linestyle='-', color='tab:red', label='Баланс за текущий день')
-        ax1.set_xlabel('Время')
+        ax1.plot(times, balances_usdt, marker='o', linestyle='-', color='tab:red', label='Баланс (текущий день)')
         ax1.set_ylabel('Баланс (USDT)')
-        ax1.set_title('Баланс за текущий день')
+        ax1.set_title('Баланс за текущий день', fontsize=14)
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         ax1.tick_params(axis='x', rotation=45)
-        ax1.grid(True)
+        ax1.grid(True, which='both', linestyle='--', linewidth=0.5)
         for i, txt in enumerate(balances_usdt):
-            ax1.annotate(f'{txt:.2f}', (times[i], balances_usdt[i]), textcoords="offset points", xytext=(0, 10), ha='center')
+            ax1.annotate(f'{txt:.2f}', (times[i], balances_usdt[i]),
+                        textcoords="offset points", xytext=(0, 10), ha='center', fontsize=8)
         ax1.legend()
 
-        ax2.plot(dates, average_balances_usdt, marker='o', linestyle='-', color='tab:blue', label='Средний баланс за 30 дней')
-        ax2.set_xlabel('Дата')
+        ax2.plot(dates_last_month, average_balances_usdt_last_month, marker='o', linestyle='-', color='tab:blue', label='Средний баланс (30 дней)')
         ax2.set_ylabel('Средний баланс (USDT)')
-        ax2.set_title('Средний баланс за последние 30 дней')
+        ax2.set_title('Средний баланс за последние 30 дней', fontsize=14)
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%d'))
         ax2.tick_params(axis='x', rotation=45)
-        ax2.grid(True)
-        for i, txt in enumerate(average_balances_usdt):
-            ax2.annotate(f'{txt:.2f}', (dates[i], average_balances_usdt[i]), textcoords="offset points", xytext=(0, 10), ha='center')
+        ax2.grid(True, which='both', linestyle='--', linewidth=0.5)
+        for i in range(len(dates_last_month)):
+            ax2.annotate(
+                f'{max_balances_last_month[i]:.2f}\n{average_balances_usdt_last_month[i]:.2f}\n{min_balances_last_month[i]:.2f}',
+                (dates_last_month[i], average_balances_usdt_last_month[i]),
+                textcoords="offset points", xytext=(0, 10), ha='center', fontsize=7
+            )
         ax2.legend()
 
-        plt.tight_layout()
+        if average_monthly_balances_year:
+            ax3.plot(dates_year, average_balances_usdt_year, marker='o', linestyle='-', color='tab:green', label='Средний баланс (год)')
+            ax3.set_ylabel('Средний баланс (USDT)')
+            ax3.set_title('Средний баланс за последний год', fontsize=14)
+            ax3.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+            ax3.tick_params(axis='x', rotation=45)
+            ax3.grid(True, which='both', linestyle='--', linewidth=0.5)
+            for i in range(len(dates_year)):
+                ax3.annotate(
+                    f'{max_balances_year[i]:.2f}\n{average_balances_usdt_year[i]:.2f}\n{min_balances_year[i]:.2f}',
+                    (dates_year[i], average_balances_usdt_year[i]),
+                    textcoords="offset points", xytext=(0, 10), ha='center', fontsize=7
+                )
+            ax3.legend()
+        else:
+            ax3.text(0.5, 0.5, 'Нет данных за последний год', horizontalalignment='center',
+                     verticalalignment='center', transform=ax3.transAxes)
+
+        bot_info_lines = []
+        if bots_data:
+            bot_info_lines.append("Информация о ботах:")
+            for idx, trading_bot in enumerate(bots_data):
+                b_type = trading_bot.get('type', 'N/A')
+                symbol = 'N/A'
+                invested = 'N/A'
+                pnl = 'N/A'
+                pnl_per = '0.00%'
+                price_range = 'N/A'
+                price_drop = 'N/A'
+                cell_num = 'N/A'
+                add_pos_per = 'N/A'
+
+                if b_type == 'GRID_FUTURES' and trading_bot.get('future_grid'):
+                    fg = trading_bot['future_grid']
+                    symbol = fg.get('symbol', 'N/A')
+                    invested = fg.get('total_investment', 'N/A')
+                    pnl = fg.get('pnl', 'N/A')
+                    try:
+                        pnl_value = float(fg.get('pnl_per', '0'))
+                        pnl_per = f"{pnl_value * 100:.2f}%"
+                    except:
+                        pnl_per = "0.00%"
+                    price_range = f"{fg.get('min_price', 'N/A')}/{fg.get('max_price', 'N/A')}"
+                    price_drop = fg.get('liq_price', 'N/A')
+                    cell_num = fg.get('cell_num', 'N/A')
+                    add_pos_per = fg.get('leverage', 'N/A')
+
+                elif b_type == 'MART_FUTURES' and trading_bot.get('fmart'):
+                    fmtr = trading_bot['fmart']
+                    symbol = fmtr.get('symbol', 'N/A')
+                    invested = fmtr.get('total_margin', 'N/A')
+                    pnl = fmtr.get('total_profit', 'N/A')
+                    try:
+                        pnl_value = float(fmtr.get('total_profit_per', '0'))
+                        pnl_per = f"{pnl_value * 100:.2f}%"
+                    except:
+                        pnl_per = "0.00%"
+                    price_range = 'N/A'
+                    price_drop = 'N/A'
+                    cell_num = 'N/A'
+                    add_pos_per = fmtr.get('add_pos_per', 'N/A')
+
+                elif b_type == 'GRID_SPOT' and trading_bot.get('grid', {}).get('info'):
+                    gr = trading_bot['grid']['info']
+                    profit = trading_bot['grid']['profit']
+                    symbol = gr.get('symbol', 'N/A')
+                    invested = gr.get('total_investment', 'N/A')
+                    pnl = profit.get('total_profit', 'N/A')
+                    try:
+                        pnl_value = float(profit.get('total_apr', '0'))
+                        pnl_per = f"{pnl_value * 100:.2f}%"
+                    except:
+                        pnl_per = "0.00%"
+                    price_range = f"{gr.get('min_price', 'N/A')}/{gr.get('max_price', 'N/A')}"
+                    price_drop = gr.get('liq_price', 'N/A')
+                    cell_num = gr.get('cell_number', 'N/A')
+                    add_pos_per = 'N/A'
+
+                bot_text = (
+                    f"*{symbol}*\n" 
+                    f"Инвестировано (USDT): {invested}\n"
+                    f"Общий P&L (USDT): {pnl}\n"
+                    f"Ценовой диапазон (USDT): {price_range}\n"
+                    f"Снижение цены: {price_drop}\n"
+                    f"Кол-во сеток: {cell_num}\n"
+                    f"Множитель позиции: {add_pos_per}\n"
+                    f"% PnL: *{pnl_per}*"
+                )
+
+                bot_info_lines.append(bot_text)
+
+        else:
+            bot_info_lines.append("Нет данных о ботах.")
+
+        bot_info_text = "\n\n".join(bot_info_lines)
+
+        ax4.text(0.02, 0.98, bot_info_text, ha='left', va='top', wrap=True, fontsize=10,
+                 bbox=dict(facecolor='lightgray', edgecolor='gray', boxstyle='round,pad=0.5'),
+                 transform=ax4.transAxes, color='black', fontweight='normal')
 
         graph_filename = 'graph.png'
-        plt.savefig(graph_filename)
+        plt.savefig(graph_filename, dpi=300)
         plt.close()
 
         with open(graph_filename, 'rb') as photo:
-            bot.send_photo(message.chat.id, photo)
-
+            bot.send_photo(message.chat.id, photo, parse_mode='Markdown')
     except Exception as e:
-        logging.error(f"Ошибка при создании графика: {e}")
-        bot.send_message(message.chat.id, f"Ошибка при создании графика: {e}")
+        print(f"Ошибка генерации графика: {e}")
+        bot.send_message(message.chat.id, "Произошла ошибка при генерации графика.")
 
 
 def wait_until_next_interval(minutes):
-    # Дождаться следующего кратного minutes интервала в часе
     now = datetime.now()
-    # Рассчитаем следующую точку времени
-    # Например, если minutes=10, мы хотим 00:00, 00:10, 00:20...
     minute = (now.minute // minutes + 1) * minutes
     hour = now.hour
     if minute >= 60:
@@ -393,7 +579,6 @@ def wait_until_next_interval(minutes):
     target = datetime(now.year, now.month, now.day, hour, minute, 0)
     delta = (target - now).total_seconds()
     if delta < 0:
-        # Если вдруг получилось меньше 0, значит следующий интервал завтра
         target += timedelta(days=1)
         delta = (target - now).total_seconds()
     sleep(delta)
@@ -401,7 +586,7 @@ def wait_until_next_interval(minutes):
 def db_update_loop():
     while not stop_threads:
         if not WAITING_FOR_RENEW:
-            fetch_balance()  # обновляем в БД
+            fetch_balance()
         wait_until_next_interval(db_update_interval)
 
 def balance_send_loop():
@@ -416,26 +601,29 @@ def balance_send_loop():
         wait_until_next_interval(balance_send_interval)
 
 
+threads_started = False
+
 def start_threads():
-    global db_update_thread, balance_send_thread, stop_threads
+    global db_update_thread, balance_send_thread, stop_threads, threads_started
+    if threads_started:
+        return
     stop_threads = False
     db_update_thread = threading.Thread(target=db_update_loop, daemon=True)
     balance_send_thread = threading.Thread(target=balance_send_loop, daemon=True)
     db_update_thread.start()
     balance_send_thread.start()
+    threads_started = True
 
 def stop_all_threads():
-    global stop_threads
+    global stop_threads, threads_started
     stop_threads = True
-
-# ---------------------- Админская панель ----------------------
+    threads_started = False
 
 def is_admin(user_id):
     return user_id in admins
 
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
-    # Только админ и только в личном чате
     if message.chat.type != 'private':
         return
     if not is_admin(message.from_user.id):
@@ -454,7 +642,7 @@ def admin_panel(message):
     markup.add(types.InlineKeyboardButton("Добавить админа", callback_data="add_admin"))
     markup.add(types.InlineKeyboardButton("Удалить админа", callback_data="remove_admin"))
     markup.add(types.InlineKeyboardButton("Показать текущие настройки", callback_data="show_config"))
-    markup.add(types.InlineKeyboardButton("Перезапустить бота", callback_data="reload_bot"))  # изменено
+    markup.add(types.InlineKeyboardButton("Перезапустить бота", callback_data="reload_bot"))
     markup.add(types.InlineKeyboardButton("Снять режим ожидания", callback_data="resume_bot" if WAITING_FOR_RENEW else "no_wait_mode"))
 
     bot.send_message(message.chat.id, "Панель админа:", reply_markup=markup)
@@ -464,9 +652,7 @@ pending_actions = {}
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_admin(call):
-    # Сначала подтвердим callback_query, чтобы избежать "query is too old"
     bot.answer_callback_query(call.id)
-
     user_id = call.from_user.id
     chat_type = call.message.chat.type if call.message else None
     if chat_type != 'private':
@@ -516,7 +702,6 @@ def callback_admin(call):
         )
         bot.send_message(user_id, conf_text)
     elif call.data == "reload_bot":
-        # Перечитать конфиг и перезапустить потоки с новыми параметрами
         reload_config()
         bot.send_message(user_id, "Конфиг перезагружен, бот работает с новыми параметрами.")
     elif call.data == "resume_bot":
@@ -542,10 +727,8 @@ def reload_config():
     balance_send_interval = config.get('balance_send_interval', 30)
     chat_id = config.get('chat_id', '')
 
-    # Останавливаем старые потоки
     stop_all_threads()
     sleep(1)
-    # Запускаем заново с новыми параметрами
     start_threads()
 
 
