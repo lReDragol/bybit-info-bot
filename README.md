@@ -131,8 +131,4 @@ python tgbybit.py
 - `POST /api/db/query`
 - `POST /api/actions/sync`
 
-## Безопасность
 
-- реальный `config.json` не должен попадать в git
-- в репозитории лежит безопасный `config.example.json`
-- опубликованный `config.json` очищен от токенов, cookies, chat/admin данных
